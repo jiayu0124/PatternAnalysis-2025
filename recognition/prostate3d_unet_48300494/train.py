@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader  # noqa: E402
 from dataset import Prostate3DDataset  # noqa: E402
 from modules import UNet3D  # noqa: E402
 from utils import DiceLoss, dice_coefficients  # noqa: E402
+import csv
 
 
 def pad_collate(batch: Tuple[Tuple[torch.Tensor, torch.Tensor], ...]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -76,6 +77,16 @@ def pad_collate(batch: Tuple[Tuple[torch.Tensor, torch.Tensor], ...]) -> Tuple[t
     return torch.stack(padded_images), torch.stack(padded_labels)
 
 
+def _write_metrics_csv(path: str, epoch: int, train_loss: float, val_loss: float, val_dice: float) -> None:
+    header = ["epoch", "train_loss", "val_loss", "val_dice"]
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(header)
+        writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_dice:.6f}"])
+
+
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     # Create datasets
@@ -92,6 +103,7 @@ def train(args: argparse.Namespace) -> None:
     history = {"train_loss": [], "val_loss": [], "val_dice": []}
     best_dice = 0.0
     os.makedirs(args.out_dir, exist_ok=True)
+    metrics_csv = os.path.join(args.out_dir, "metrics.csv")
     # Training loop
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -105,7 +117,7 @@ def train(args: argparse.Namespace) -> None:
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * images.size(0)
-        train_loss = running_loss / len(train_ds)
+        train_loss = running_loss / len(train_ds) if len(train_ds) > 0 else 0.0
         history["train_loss"].append(train_loss)
         # Validation
         model.eval()
@@ -119,7 +131,7 @@ def train(args: argparse.Namespace) -> None:
                 loss = criterion(outputs, labels)
                 val_loss += loss.item() * images.size(0)
                 dice_scores.append(dice_coefficients(outputs, labels, args.num_classes))
-        val_loss /= len(val_ds)
+        val_loss = val_loss / len(val_ds) if len(val_ds) > 0 else 0.0
         # Compute mean Dice across batches and classes
         if dice_scores:
             dice_scores = np.array(dice_scores)
@@ -128,28 +140,36 @@ def train(args: argparse.Namespace) -> None:
             mean_dice = 0.0
         history["val_loss"].append(val_loss)
         history["val_dice"].append(mean_dice)
+        # Save metrics to CSV so plotting can be reproduced even if process is interrupted
+        _write_metrics_csv(metrics_csv, epoch, train_loss, val_loss, mean_dice)
         # Save best model
         if mean_dice > best_dice:
             best_dice = mean_dice
             torch.save(model.state_dict(), os.path.join(args.out_dir, "best_model.pt"))
         print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {mean_dice:.4f}")
-    # Plot learning curves
-    epochs = range(1, args.epochs + 1)
+    # Plot learning curves using the recorded history length (avoid relying on args.epochs)
+    n_epochs_recorded = len(history["train_loss"])
+    if n_epochs_recorded == 0:
+        print("No training history recorded, skipping plot generation.")
+        return
+    epochs = range(1, n_epochs_recorded + 1)
     fig, ax1 = plt.subplots(figsize=(6, 4))
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Loss")
-    ax1.plot(epochs, history["train_loss"], label="Train Loss")
-    ax1.plot(epochs, history["val_loss"], label="Val Loss")
+    # Use markers so single-epoch plots are visible
+    ax1.plot(epochs, history["train_loss"], label="Train Loss", marker='o')
+    ax1.plot(epochs, history["val_loss"], label="Val Loss", marker='o')
     ax1.legend(loc="upper left")
     # Create a second y‑axis for Dice
     ax2 = ax1.twinx()
     ax2.set_ylabel("Mean Dice")
-    ax2.plot(epochs, history["val_dice"], label="Val Dice", linestyle="--")
+    ax2.plot(epochs, history["val_dice"], label="Val Dice", linestyle="--", marker='o')
     ax2.legend(loc="upper right")
     plt.title("Training Curves")
     plt.tight_layout()
     curve_path = os.path.join(args.out_dir, "curves.png")
     plt.savefig(curve_path)
+    plt.close(fig)
     print(f"Training complete. Best mean Dice: {best_dice:.4f}. Curves saved to {curve_path}")
 
 
@@ -157,8 +177,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a 3‑D UNet on the prostate dataset")
     parser.add_argument("--root_img", type=str, required=True, help="Directory containing MRI volumes")
     parser.add_argument("--root_lbl", type=str, required=True, help="Directory containing segmentation labels")
-    parser.add_argument("--train_list", type=str, required=True, help="Text file listing training cases")
     parser.add_argument("--val_list", type=str, required=True, help="Text file listing validation cases")
+    parser.add_argument("--train_list", type=str, required=True, help="Text file listing training cases")
     parser.add_argument("--out_dir", type=str, default="outputs", help="Directory to save models and plots")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size (number of volumes per batch)")
