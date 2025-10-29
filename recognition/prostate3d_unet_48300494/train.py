@@ -1,0 +1,176 @@
+"""
+train.py
+---------
+
+This script trains a 3‑D U‑Net on the prostate segmentation problem using
+PyTorch.  It performs the following steps:
+
+1. Loads a training and validation split defined in text files.
+2. Instantiates the `Prostate3DDataset` defined in `dataset.py`.
+3. Creates a DataLoader with a custom collate function that pads
+   volumes within each batch to a common spatial size.
+4. Defines a 3‑D U‑Net model, a mixed Dice + Cross‑Entropy loss and
+   an Adam optimiser.
+5. Trains for a configurable number of epochs, computing mean Dice on
+   the validation set after each epoch.  The best model (highest mean
+   Dice) is saved to disk.
+6. Saves a plot of the training/validation loss and mean Dice curves.
+
+Run this script from the project root directory.  See the README
+for example commands.
+"""
+
+import argparse
+import os
+from datetime import datetime
+from typing import Tuple
+
+import matplotlib
+matplotlib.use("Agg")  # Use a non‑interactive backend
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+
+from dataset import Prostate3DDataset  # noqa: E402
+from modules import UNet3D  # noqa: E402
+from utils import DiceLoss, dice_coefficients  # noqa: E402
+
+
+def pad_collate(batch: Tuple[Tuple[torch.Tensor, torch.Tensor], ...]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Collate function that pads all images and labels in a batch to the same size.
+
+    The largest depth/height/width across the batch is used, and padding
+    is applied to the end of each dimension.  This allows volumes of
+    different shapes to be stacked into a single tensor.  Labels are
+    padded with zeros (background class).
+
+    Parameters
+    ----------
+    batch : list of tuples
+        Each element is a `(image, label)` pair returned by the dataset.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        A tuple `(images, labels)` where `images` has shape
+        `(B, 1, D_max, H_max, W_max)` and `labels` has shape
+        `(B, D_max, H_max, W_max)`.
+    """
+    images, labels = zip(*batch)
+    depths = [img.shape[1] for img in images]
+    heights = [img.shape[2] for img in images]
+    widths = [img.shape[3] for img in images]
+    max_d, max_h, max_w = max(depths), max(heights), max(widths)
+    padded_images = []
+    padded_labels = []
+    for img, lbl in zip(images, labels):
+        d_pad = max_d - img.shape[1]
+        h_pad = max_h - img.shape[2]
+        w_pad = max_w - img.shape[3]
+        padded_img = F.pad(img, (0, w_pad, 0, h_pad, 0, d_pad))
+        padded_lbl = F.pad(lbl, (0, w_pad, 0, h_pad, 0, d_pad))
+        padded_images.append(padded_img)
+        padded_labels.append(padded_lbl)
+    return torch.stack(padded_images), torch.stack(padded_labels)
+
+
+def train(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    # Create datasets
+    train_ds = Prostate3DDataset(args.train_list, args.root_img, args.root_lbl, augment=True)
+    val_ds = Prostate3DDataset(args.val_list, args.root_img, args.root_lbl, augment=False)
+    # DataLoaders
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=pad_collate)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=pad_collate)
+    # Model, loss, optimiser
+    model = UNet3D(in_channels=1, num_classes=args.num_classes, base_channels=args.base_channels).to(device)
+    criterion = DiceLoss(weight=args.dice_weight)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Training history
+    history = {"train_loss": [], "val_loss": [], "val_dice": []}
+    best_dice = 0.0
+    os.makedirs(args.out_dir, exist_ok=True)
+    # Training loop
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        running_loss = 0.0
+        for images, labels in train_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * images.size(0)
+        train_loss = running_loss / len(train_ds)
+        history["train_loss"].append(train_loss)
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        dice_scores = []
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * images.size(0)
+                dice_scores.append(dice_coefficients(outputs, labels, args.num_classes))
+        val_loss /= len(val_ds)
+        # Compute mean Dice across batches and classes
+        if dice_scores:
+            dice_scores = np.array(dice_scores)
+            mean_dice = float(dice_scores.mean())
+        else:
+            mean_dice = 0.0
+        history["val_loss"].append(val_loss)
+        history["val_dice"].append(mean_dice)
+        # Save best model
+        if mean_dice > best_dice:
+            best_dice = mean_dice
+            torch.save(model.state_dict(), os.path.join(args.out_dir, "best_model.pt"))
+        print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {mean_dice:.4f}")
+    # Plot learning curves
+    epochs = range(1, args.epochs + 1)
+    fig, ax1 = plt.subplots(figsize=(6, 4))
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.plot(epochs, history["train_loss"], label="Train Loss")
+    ax1.plot(epochs, history["val_loss"], label="Val Loss")
+    ax1.legend(loc="upper left")
+    # Create a second y‑axis for Dice
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("Mean Dice")
+    ax2.plot(epochs, history["val_dice"], label="Val Dice", linestyle="--")
+    ax2.legend(loc="upper right")
+    plt.title("Training Curves")
+    plt.tight_layout()
+    curve_path = os.path.join(args.out_dir, "curves.png")
+    plt.savefig(curve_path)
+    print(f"Training complete. Best mean Dice: {best_dice:.4f}. Curves saved to {curve_path}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train a 3‑D UNet on the prostate dataset")
+    parser.add_argument("--root_img", type=str, required=True, help="Directory containing MRI volumes")
+    parser.add_argument("--root_lbl", type=str, required=True, help="Directory containing segmentation labels")
+    parser.add_argument("--train_list", type=str, required=True, help="Text file listing training cases")
+    parser.add_argument("--val_list", type=str, required=True, help="Text file listing validation cases")
+    parser.add_argument("--out_dir", type=str, default="outputs", help="Directory to save models and plots")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size (number of volumes per batch)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--num_classes", type=int, default=5, help="Number of segmentation classes")
+    parser.add_argument("--base_channels", type=int, default=32, help="Number of base channels in UNet")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--dice_weight", type=float, default=1.0, help="Weight of Dice loss (0–1).  1 uses only Dice loss, 0 only CE.")
+    parser.add_argument("--no_cuda", action="store_true", help="Force training on CPU even if CUDA is available")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    train(args)
