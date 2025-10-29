@@ -38,6 +38,7 @@ import os
 import random
 from typing import List, Tuple
 
+import glob
 import nibabel as nib  # type: ignore
 import numpy as np
 import torch
@@ -120,10 +121,35 @@ class Prostate3DDataset(Dataset):
     def __len__(self) -> int:
         return len(self.case_ids)
 
+    def _find_file(self, root: str, case_id: str) -> str:
+        """Find a file under `root` that matches `case_id`.
+
+        The function first tries the exact filename `{case_id}.nii.gz`. If
+        that doesn't exist it will try glob patterns such as
+        `{case_id}*.nii*` and return the first match. Raises
+        FileNotFoundError if no candidate is found.
+        """
+        # Try exact match first
+        exact = os.path.join(root, f"{case_id}.nii.gz")
+        if os.path.exists(exact):
+            return exact
+        # Fallback to glob search (covers cases like labels with extra token e.g. _SEMANTIC)
+        pattern = os.path.join(root, f"{case_id}*.nii*")
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
+        # As a final fallback try search for filenames that contain the case_id anywhere
+        pattern_any = os.path.join(root, f"*{case_id}*.nii*")
+        matches_any = glob.glob(pattern_any)
+        if matches_any:
+            return matches_any[0]
+        raise FileNotFoundError(f"No file found for case_id '{case_id}' in {root}")
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         case_id = self.case_ids[idx]
-        img_path = os.path.join(self.root_img, f"{case_id}.nii.gz")
-        lbl_path = os.path.join(self.root_lbl, f"{case_id}.nii.gz")
+        # Use flexible file discovery to handle slightly different naming conventions
+        img_path = self._find_file(self.root_img, case_id)
+        lbl_path = self._find_file(self.root_lbl, case_id)
         # Load image and label volumes
         img = nib.load(img_path).get_fdata(caching="unchanged").astype(np.float32)
         lbl = nib.load(lbl_path).get_fdata(caching="unchanged").astype(np.int64)
@@ -141,3 +167,4 @@ class Prostate3DDataset(Dataset):
         image_tensor = torch.from_numpy(img).unsqueeze(0).float()  # shape (1, D, H, W)
         label_tensor = torch.from_numpy(lbl).long()  # shape (D, H, W)
         return image_tensor, label_tensor
+

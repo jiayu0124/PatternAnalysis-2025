@@ -20,7 +20,7 @@ Refer to the README for more information.
 
 import argparse
 import os
-from typing import List
+from typing import List, Optional
 
 import nibabel as nib  # type: ignore
 import numpy as np
@@ -52,12 +52,70 @@ def pad_collate(batch):
     return torch.stack(padded_images), torch.stack(padded_labels)
 
 
+def infer_num_classes_from_checkpoint(ckpt_path: str, map_location: str = 'cpu') -> int:
+    """Load checkpoint state_dict and infer number of output classes from outc.weight shape.
+
+    Returns the number of classes inferred. Raises RuntimeError if inference fails.
+    """
+    state = torch.load(ckpt_path, map_location=map_location)
+    # If the checkpoint is a dict with 'state_dict' or similar, try to find it
+    if isinstance(state, dict):
+        # common patterns: full state_dict was saved directly, or saved as {'model_state_dict': ...}
+        # Try several keys
+        candidates = ['state_dict', 'model_state_dict']
+        sd = None
+        for k in candidates:
+            if k in state and isinstance(state[k], dict):
+                sd = state[k]
+                break
+        if sd is None and all(isinstance(v, torch.Tensor) for v in state.values()):
+            sd = state  # assume it's the state_dict itself
+    else:
+        sd = None
+    if sd is None:
+        raise RuntimeError(f"Unable to interpret checkpoint at {ckpt_path} to infer num_classes")
+    # Look for 'outc.weight' or keys that end with 'outc.weight'
+    outc_key = None
+    for k in sd.keys():
+        if k.endswith('outc.weight'):
+            outc_key = k
+            break
+    if outc_key is None:
+        raise RuntimeError("Checkpoint does not contain an 'outc.weight' parameter to infer num_classes")
+    outc_weight = sd[outc_key]
+    if not isinstance(outc_weight, torch.Tensor):
+        raise RuntimeError("Unexpected type for outc.weight in checkpoint")
+    num_classes = outc_weight.shape[0]
+    return int(num_classes)
+
+
 def evaluate(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     test_ds = Prostate3DDataset(args.test_list, args.root_img, args.root_lbl, augment=False)
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, collate_fn=pad_collate)
-    model = UNet3D(in_channels=1, num_classes=args.num_classes, base_channels=args.base_channels)
-    model.load_state_dict(torch.load(args.model, map_location=device))
+
+    # If num_classes not provided, try to infer from checkpoint
+    num_classes = args.num_classes
+    if num_classes is None:
+        try:
+            num_classes = infer_num_classes_from_checkpoint(args.model, map_location=device)
+            print(f"Inferred num_classes={num_classes} from checkpoint {args.model}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to infer num_classes from checkpoint: {e}")
+
+    model = UNet3D(in_channels=1, num_classes=num_classes, base_channels=args.base_channels)
+    # Load checkpoint state dict (map to device)
+    state = torch.load(args.model, map_location=device)
+    # If checkpoint wraps state_dict in another dict, extract it
+    if isinstance(state, dict) and 'state_dict' in state and isinstance(state['state_dict'], dict):
+        state_dict = state['state_dict']
+    elif isinstance(state, dict) and 'model_state_dict' in state and isinstance(state['model_state_dict'], dict):
+        state_dict = state['model_state_dict']
+    elif isinstance(state, dict) and all(isinstance(v, torch.Tensor) for v in state.values()):
+        state_dict = state
+    else:
+        raise RuntimeError("Unrecognized checkpoint format when loading state_dict")
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     all_dice: List[List[float]] = []
@@ -69,7 +127,7 @@ def evaluate(args: argparse.Namespace) -> None:
             images = images.to(device)
             labels = labels.to(device)
             outputs = model(images)
-            dice = dice_coefficients(outputs, labels, args.num_classes)
+            dice = dice_coefficients(outputs, labels, num_classes)
             all_dice.append(dice)
             if args.save_dir:
                 # Save predicted segmentation as NIfTI
@@ -100,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_list", type=str, required=True, help="Text file listing test cases")
     parser.add_argument("--model", type=str, required=True, help="Path to the trained model (.pt) file")
     parser.add_argument("--save_dir", type=str, default=None, help="Directory to save predicted volumes (optional)")
-    parser.add_argument("--num_classes", type=int, default=5, help="Number of segmentation classes")
+    parser.add_argument("--num_classes", type=int, default=None, help="Number of segmentation classes. If omitted, inferred from the checkpoint if possible.")
     parser.add_argument("--base_channels", type=int, default=32, help="Number of base channels in UNet")
     parser.add_argument("--no_cuda", action="store_true", help="Force evaluation on CPU even if CUDA is available")
     return parser.parse_args()
