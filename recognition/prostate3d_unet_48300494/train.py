@@ -180,7 +180,7 @@ def train(args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"[Warn] Failed to parse --ce_weights: {e}; ignoring.")
             ce_w = None
-    criterion = DiceLoss(weight=args.dice_weight, ignore_bg=args.ignore_bg, ce_weight=ce_w)
+    criterion = DiceLoss(weight=args.dice_weight, ignore_bg=True, ce_weight=ce_w)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # AMP scaler (only meaningful on CUDA)
@@ -261,9 +261,7 @@ def train(args: argparse.Namespace) -> None:
 
         # Threshold status for readability
         thr = getattr(args, 'dice_threshold', 0.7)
-        # Decide which classes to consider for threshold (optionally ignore background for status)
-        thr_vec = per_class_mean[1:] if getattr(args, 'threshold_ignore_bg', False) and per_class_mean.shape[0] > 1 else per_class_mean
-        all_ok = bool((thr_vec >= thr).all())
+        all_ok = bool((per_class_mean >= thr).all())
         status = "PASS" if all_ok else "FAIL"
         print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice(mean): {mean_dice:.4f} | min_c: {min_dice:.4f} | thr {thr} -> {status}")
         # Optional: print compact per-class vector (first few and last few if many)
@@ -323,9 +321,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dice_threshold", type=float, default=0.7, help="Threshold for per-class Dice PASS/FAIL indication")
     # Optional CE class weights for minority classes (comma-separated floats)
     parser.add_argument("--ce_weights", type=str, default=None, help="Comma-separated CE class weights (length=num_classes), e.g. '0.2,1,1,1,2,2'")
-    # Background handling flags
-    parser.add_argument("--ignore_bg", action="store_true", help="Ignore background class when computing Dice component of the loss")
-    parser.add_argument("--threshold_ignore_bg", action="store_true", help="Ignore background class when deciding PASS/FAIL against dice_threshold")
     return parser.parse_args()
 
 
