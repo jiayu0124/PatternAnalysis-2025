@@ -87,6 +87,22 @@ def _write_metrics_csv(path: str, epoch: int, train_loss: float, val_loss: float
         writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_dice:.6f}"])
 
 
+def _write_metrics_per_class_csv(path: str, epoch: int, per_class: np.ndarray, mean_dice: float, min_dice: float, max_dice: float) -> None:
+    """Write per-class Dice metrics to a separate CSV to avoid header mismatch with legacy metrics.csv.
+    Columns: epoch, mean, min, max, dice_c0..dice_c{K}.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    num_classes = per_class.shape[0]
+    header = ["epoch", "mean", "min", "max"] + [f"dice_c{i}" for i in range(num_classes)]
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(header)
+        row = [epoch, f"{mean_dice:.6f}", f"{min_dice:.6f}", f"{max_dice:.6f}"] + [f"{float(v):.6f}" for v in per_class.tolist()]
+        writer.writerow(row)
+
+
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     # Enable cuDNN autotuner for potentially faster convs on fixed shapes
@@ -164,6 +180,7 @@ def train(args: argparse.Namespace) -> None:
     best_dice = 0.0
     os.makedirs(args.out_dir, exist_ok=True)
     metrics_csv = os.path.join(args.out_dir, "metrics.csv")
+    metrics_pc_csv = os.path.join(args.out_dir, "metrics_per_class.csv")
 
     # Training loop
     for epoch in range(1, args.epochs + 1):
@@ -190,7 +207,8 @@ def train(args: argparse.Namespace) -> None:
         # Validation
         model.eval()
         val_loss = 0.0
-        dice_scores = []
+        # accumulate per-batch per-class dice
+        per_class_batches: list[np.ndarray] = []
         with torch.no_grad():
             for images, labels in val_loader:
                 images = images.to(device, non_blocking=True)
@@ -200,27 +218,47 @@ def train(args: argparse.Namespace) -> None:
                     outputs = model(images)
                     loss = criterion(outputs, labels)
                 val_loss += loss.item() * images.size(0)
-                dice_scores.append(dice_coefficients(outputs, labels, args.num_classes))
+                pc_list = dice_coefficients(outputs, labels, args.num_classes)
+                per_class_batches.append(np.array(pc_list, dtype=np.float32))
         val_loss = val_loss / len(val_ds) if len(val_ds) > 0 else 0.0
 
-        # Compute mean Dice across batches and classes
-        if dice_scores:
-            dice_scores = np.array(dice_scores)
-            mean_dice = float(dice_scores.mean())
+        # Aggregate per-class across batches
+        if per_class_batches:
+            per_class_mean = np.stack(per_class_batches, axis=0).mean(axis=0)
+            min_dice = float(per_class_mean.min())
+            max_dice = float(per_class_mean.max())
+            mean_dice = float(per_class_mean.mean())
         else:
+            per_class_mean = np.zeros((args.num_classes,), dtype=np.float32)
+            min_dice = 0.0
+            max_dice = 0.0
             mean_dice = 0.0
+
         history["val_loss"].append(val_loss)
         history["val_dice"].append(mean_dice)
 
-        # Save metrics to CSV so plotting can be reproduced even if process is interrupted
+        # Write metrics
         _write_metrics_csv(metrics_csv, epoch, train_loss, val_loss, mean_dice)
+        _write_metrics_per_class_csv(metrics_pc_csv, epoch, per_class_mean, mean_dice, min_dice, max_dice)
 
         # Save best model
         if mean_dice > best_dice:
             best_dice = mean_dice
             torch.save(model.state_dict(), os.path.join(args.out_dir, "best_model.pt"))
 
-        print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {mean_dice:.4f}")
+        # Threshold status for readability
+        thr = getattr(args, 'dice_threshold', 0.7)
+        all_ok = bool((per_class_mean >= thr).all())
+        status = "PASS" if all_ok else "FAIL"
+        print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice(mean): {mean_dice:.4f} | min_c: {min_dice:.4f} | thr {thr} -> {status}")
+        # Optional: print compact per-class vector (first few and last few if many)
+        if args.num_classes <= 10:
+            pcs = ", ".join(f"c{i}:{per_class_mean[i]:.3f}" for i in range(args.num_classes))
+            print(f"Per-class Val Dice: [{pcs}]")
+        else:
+            pcs_head = ", ".join(f"c{i}:{per_class_mean[i]:.3f}" for i in range(5))
+            pcs_tail = ", ".join(f"c{i}:{per_class_mean[i]:.3f}" for i in range(args.num_classes-5, args.num_classes))
+            print(f"Per-class Val Dice: [{pcs_head}, ..., {pcs_tail}]")
 
     # Plot learning curves using the recorded history length (avoid relying on args.epochs)
     n_epochs_recorded = len(history["train_loss"])
@@ -266,6 +304,8 @@ def parse_args() -> argparse.Namespace:
     # New fast-preflight controls
     parser.add_argument("--skip_label_scan", action="store_true", help="Skip label range preflight to start training immediately")
     parser.add_argument("--label_scan_limit", type=int, default=2, help="Number of training samples to scan for label validation (0 disables)")
+    # New dice threshold for status line
+    parser.add_argument("--dice_threshold", type=float, default=0.7, help="Threshold for per-class Dice PASS/FAIL indication")
     return parser.parse_args()
 
 
