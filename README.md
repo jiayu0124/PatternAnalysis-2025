@@ -31,6 +31,7 @@ Table of Contents
 - 9. Commit Log & PR Checklist
 - 10. Limitations & Future Work
 - 11. References
+- 12. AI Assistance Declaration
 
 1. Problem & Objective
 We address Project 7 (Normal Difficulty – 3D UNet): Segment the Prostate 3D dataset into multiple anatomical classes using a 3D UNet, achieving Dice ≥ 0.7 for every class on a held-out test set. The target is a robust, reproducible pipeline with documented instructions, code, and results.
@@ -186,3 +187,11 @@ python -u recognition\prostate3d_unet_48300494\predict.py ... ^
 - Çiçek, Ö., Abdulkadir, A., Lienkamp, S.S., Brox, T., & Ronneberger, O. (2016). 3D U-Net: Learning Dense Volumetric Segmentation from Sparse Annotation. In MICCAI 2016, LNCS 9901, pp. 424–432. Springer. doi:10.1007/978-3-319-46723-8_49. Preprint: https://arxiv.org/abs/1606.06650
 - Isensee, F., Jaeger, P.F., Kohl, S.A.A., Petersen, J., & Maier-Hein, K.H. (2021). nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. Nature Methods, 18, 203–211. doi:10.1038/s41592-020-01008-z. Preprint: https://arxiv.org/abs/1809.10486
 - COMP3710 Assessment Brief (Project 7): Course-provided specification for Pattern Analysis recognition tasks (accessed Oct 2025).
+
+12. AI Assistance Declaration
+- Policy: In accordance with the course brief (Section 1.5 Use of Artificial Intelligence), AI tooling was permitted to assist learning and workflows.
+- Tools used: GitHub Copilot (IDE suggestions and completions) and comparable LLM assistants for drafting small code snippets, refactoring, PowerShell/CMD command crafting, and documentation wording.
+- Scope of assistance: AI suggestions were accepted and adapted primarily for boilerplate, logging, plotting, and documentation. The model design choices, dataset logic, training/evaluation scripts, experiments, hyperparameters, and final implementation decisions were made by the author. All code paths were reviewed and executed locally; metrics and plots were produced from local runs.
+- Originality and attribution: No verbatim third‑party code was pasted without attribution. Where external ideas influenced the implementation (e.g., UNet3D conventions), appropriate references are included in the References section. Commit history reflects progressive, individual development.
+- Data & privacy: No confidential datasets or patient information were uploaded to external AI services. Only generic code fragments or commands were used with AI tools.
+- Validation: AI outputs can be incorrect; therefore, all generated or suggested code was tested and, where necessary, rewritten. Reported test‑set metrics were reproduced locally with the provided scripts.

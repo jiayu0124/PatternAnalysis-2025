@@ -76,3 +76,7 @@ python -u recognition/prostate3d_unet_48300494/predict.py ... --save_dir recogni
 ## Acknowledgements
 - Based on standard UNet3D for volumetric segmentation; data provided by HipMRI Study.
 
+## AI Assistance Declaration
+- In line with the course policy (Sec. 1.5), AI tools (e.g., GitHub Copilot and LLM assistants) were used to accelerate boilerplate coding, command crafting, and documentation wording.
+- Model design, dataset logic, training/evaluation pipelines, experiments, and final decisions were implemented and verified by the author. All metrics/plots were generated from local runs.
+- No datasets or model weights were shared with external AI services. External ideas are cited in the References; no verbatim third‑party code is included without attribution.
