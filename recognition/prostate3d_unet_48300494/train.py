@@ -170,10 +170,15 @@ def train(args: argparse.Namespace) -> None:
     # Optional CE class weights: default heavier on minority classes can be provided via CLI
     ce_w = None
     if args.ce_weights is not None:
-        import numpy as np as _np
-        ce_w = torch.tensor([float(w) for w in args.ce_weights.split(',')], dtype=torch.float32, device=device)
-        if ce_w.numel() != args.num_classes:
-            print(f"[Warn] --ce_weights expects {args.num_classes} values, got {ce_w.numel()}; ignoring.")
+        try:
+            ce_w_vals = [float(w) for w in args.ce_weights.split(',')]
+            if len(ce_w_vals) == args.num_classes:
+                ce_w = torch.tensor(ce_w_vals, dtype=torch.float32, device=device)
+            else:
+                print(f"[Warn] --ce_weights expects {args.num_classes} values, got {len(ce_w_vals)}; ignoring.")
+                ce_w = None
+        except Exception as e:
+            print(f"[Warn] Failed to parse --ce_weights: {e}; ignoring.")
             ce_w = None
     criterion = DiceLoss(weight=args.dice_weight, ignore_bg=True, ce_weight=ce_w)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
