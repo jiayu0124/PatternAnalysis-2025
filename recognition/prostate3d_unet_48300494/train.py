@@ -118,25 +118,36 @@ def train(args: argparse.Namespace) -> None:
         pin_memory=pin_mem,
     )
 
-    # Robust preflight: scan train set to find max label index
-    scan_loader = DataLoader(
-        train_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=pad_collate,
-        pin_memory=False,
-    )
-    max_label_seen = -1
-    for _, _labels in scan_loader:
-        _max = int(_labels.max().item())
-        if _max > max_label_seen:
-            max_label_seen = _max
-    if max_label_seen >= 0 and max_label_seen >= args.num_classes:
-        print(
-            f"[Config Error] Detected label index {max_label_seen} in training data but num_classes={args.num_classes}. "
-            f"Please re-run with --num_classes {max_label_seen + 1}. Aborting.")
-        return
+    # Fast preflight: optionally scan a small number of samples to validate label range
+    if hasattr(args, 'skip_label_scan') and not args.skip_label_scan:
+        scan_n = min(getattr(args, 'label_scan_limit', 2), len(train_ds)) if getattr(args, 'label_scan_limit', 2) > 0 else 0
+        max_label_seen = -1
+        print(f"[Preflight] Scanning up to {scan_n} training samples for label range validation...")
+        for i in range(scan_n):
+            _, lbl = train_ds[i]
+            _max = int(lbl.max().item())
+            if _max > max_label_seen:
+                max_label_seen = _max
+            if i == 0 or i == scan_n - 1:
+                print(f"[Preflight] sample {i} max label: {_max}")
+        if max_label_seen >= 0 and max_label_seen >= args.num_classes:
+            print(
+                f"[Config Error] Detected label index {max_label_seen} but num_classes={args.num_classes}. "
+                f"Please re-run with --num_classes {max_label_seen + 1}. Aborting.")
+            return
+    elif hasattr(args, 'skip_label_scan') and args.skip_label_scan:
+        print("[Preflight] Skipped label range validation (per --skip_label_scan)")
+    else:
+        # Backward-compat: keep a minimal one-sample check if flags are absent
+        try:
+            _, _lbl = train_ds[0]
+            _mx = int(_lbl.max().item())
+            if _mx >= args.num_classes:
+                print(f"[Config Error] Detected label index {_mx} but num_classes={args.num_classes}. "
+                      f"Please re-run with --num_classes {_mx + 1}. Aborting.")
+                return
+        except Exception:
+            pass
 
     # Model, loss, optimiser
     model = UNet3D(in_channels=1, num_classes=args.num_classes, base_channels=args.base_channels).to(device)
@@ -238,7 +249,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a 3‑D UNet on the prostate dataset")
+    parser = argparse.ArgumentParser(description="Train a 3-D UNet on the prostate dataset")
     parser.add_argument("--root_img", type=str, required=True, help="Directory containing MRI volumes")
     parser.add_argument("--root_lbl", type=str, required=True, help="Directory containing segmentation labels")
     parser.add_argument("--val_list", type=str, required=True, help="Text file listing validation cases")
@@ -252,6 +263,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
     parser.add_argument("--dice_weight", type=float, default=1.0, help="Weight of Dice loss (0–1).  1 uses only Dice loss, 0 only CE.")
     parser.add_argument("--no_cuda", action="store_true", help="Force training on CPU even if CUDA is available")
+    # New fast-preflight controls
+    parser.add_argument("--skip_label_scan", action="store_true", help="Skip label range preflight to start training immediately")
+    parser.add_argument("--label_scan_limit", type=int, default=2, help="Number of training samples to scan for label validation (0 disables)")
     return parser.parse_args()
 
 
