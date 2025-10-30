@@ -35,17 +35,28 @@ class DiceLoss(nn.Module):
         When set to 1.0 (default) only Dice loss is used.
     smooth : float, optional
         Smoothing constant to avoid division by zero.  Defaults to 1e-5.
+    ignore_bg : bool, optional
+        Whether to ignore the background class (class 0) when computing
+        the Dice loss.  Defaults to False.
+    ce_weight : torch.Tensor or None, optional
+        Class weights for the cross-entropy loss. If provided, should
+        be a 1D tensor with a weight for each class. Background class
+        weight is ceiled to 0.0. Defaults to None.
     """
 
-    def __init__(self, weight: float = 1.0, smooth: float = 1e-5) -> None:
+    def __init__(self, weight: float = 1.0, smooth: float = 1e-5, ignore_bg: bool = False, ce_weight: torch.Tensor | None = None) -> None:
         super().__init__()
         self.weight = weight
         self.smooth = smooth
-        self.ce = nn.CrossEntropyLoss()
+        self.ignore_bg = ignore_bg
+        self.register_buffer('ce_weight_buf', ce_weight if ce_weight is not None else None, persistent=False)
+        self.ce = nn.CrossEntropyLoss(weight=self.ce_weight_buf if self.ce_weight_buf is not None else None)
 
     def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         num_classes = preds.shape[1]
-        # Cross entropy component
+        # (optional) class-weighted CrossEntropy component
+        if self.ce_weight_buf is not None and self.ce_weight_buf.device != preds.device:
+            self.ce = nn.CrossEntropyLoss(weight=self.ce_weight_buf.to(preds.device))
         ce_loss = self.ce(preds, targets)
         # Convert targets to one‑hot format
         targets_one_hot = F.one_hot(targets, num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
@@ -54,8 +65,12 @@ class DiceLoss(nn.Module):
         # Compute Dice per class
         intersection = (probs * targets_one_hot).sum(dim=(2, 3, 4))
         union = probs.sum(dim=(2, 3, 4)) + targets_one_hot.sum(dim=(2, 3, 4))
-        dice_per_class = (2 * intersection + self.smooth) / (union + self.smooth)
-        dice_loss = 1 - dice_per_class.mean()
+        dice_per_class = (2 * intersection + self.smooth) / (union + self.smooth)  # shape (N, C)
+        # Average per sample and class, optionally ignore background (class 0)
+        if self.ignore_bg and num_classes > 1:
+            dice_loss = 1 - dice_per_class[:, 1:].mean()
+        else:
+            dice_loss = 1 - dice_per_class.mean()
         return self.weight * dice_loss + (1 - self.weight) * ce_loss
 
 
@@ -81,8 +96,8 @@ def dice_coefficients(preds: torch.Tensor, targets: torch.Tensor, num_classes: i
         pred_labels = torch.argmax(preds, dim=1)
         dice_scores: List[float] = []
         for c in range(num_classes):
-            pred_c = (pred_labels == c).float()
-            target_c = (targets == c).float()
+            pred_c = (pred_labels == c).to(torch.float32)
+            target_c = (targets == c).to(torch.float32)
             intersection = (pred_c * target_c).sum(dim=(1, 2, 3))
             union = pred_c.sum(dim=(1, 2, 3)) + target_c.sum(dim=(1, 2, 3))
             dice = (2 * intersection + 1e-5) / (union + 1e-5)

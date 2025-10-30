@@ -167,7 +167,15 @@ def train(args: argparse.Namespace) -> None:
 
     # Model, loss, optimiser
     model = UNet3D(in_channels=1, num_classes=args.num_classes, base_channels=args.base_channels).to(device)
-    criterion = DiceLoss(weight=args.dice_weight)
+    # Optional CE class weights: default heavier on minority classes can be provided via CLI
+    ce_w = None
+    if args.ce_weights is not None:
+        import numpy as np as _np
+        ce_w = torch.tensor([float(w) for w in args.ce_weights.split(',')], dtype=torch.float32, device=device)
+        if ce_w.numel() != args.num_classes:
+            print(f"[Warn] --ce_weights expects {args.num_classes} values, got {ce_w.numel()}; ignoring.")
+            ce_w = None
+    criterion = DiceLoss(weight=args.dice_weight, ignore_bg=True, ce_weight=ce_w)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # AMP scaler (only meaningful on CUDA)
@@ -306,6 +314,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label_scan_limit", type=int, default=2, help="Number of training samples to scan for label validation (0 disables)")
     # New dice threshold for status line
     parser.add_argument("--dice_threshold", type=float, default=0.7, help="Threshold for per-class Dice PASS/FAIL indication")
+    # Optional CE class weights for minority classes (comma-separated floats)
+    parser.add_argument("--ce_weights", type=str, default=None, help="Comma-separated CE class weights (length=num_classes), e.g. '0.2,1,1,1,2,2'")
     return parser.parse_args()
 
 
