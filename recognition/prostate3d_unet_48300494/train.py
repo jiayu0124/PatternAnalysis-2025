@@ -22,7 +22,7 @@ for example commands.
 
 import argparse
 import os
-from datetime import datetime
+from contextlib import nullcontext
 from typing import Tuple
 
 import matplotlib
@@ -89,49 +89,109 @@ def _write_metrics_csv(path: str, epoch: int, train_loss: float, val_loss: float
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    # Enable cuDNN autotuner for potentially faster convs on fixed shapes
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     # Create datasets
     train_ds = Prostate3DDataset(args.train_list, args.root_img, args.root_lbl, augment=True)
     val_ds = Prostate3DDataset(args.val_list, args.root_img, args.root_lbl, augment=False)
-    # DataLoaders
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=pad_collate)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=pad_collate)
+
+    # DataLoaders (use pin_memory when on CUDA for faster host->device copies)
+    pin_mem = device.type == "cuda"
+    # Visible runtime info
+    print(f"Using device: {device}. pin_memory={pin_mem}")
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=pad_collate,
+        pin_memory=pin_mem,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=pad_collate,
+        pin_memory=pin_mem,
+    )
+
+    # Robust preflight: scan train set to find max label index
+    scan_loader = DataLoader(
+        train_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=pad_collate,
+        pin_memory=False,
+    )
+    max_label_seen = -1
+    for _, _labels in scan_loader:
+        _max = int(_labels.max().item())
+        if _max > max_label_seen:
+            max_label_seen = _max
+    if max_label_seen >= 0 and max_label_seen >= args.num_classes:
+        print(
+            f"[Config Error] Detected label index {max_label_seen} in training data but num_classes={args.num_classes}. "
+            f"Please re-run with --num_classes {max_label_seen + 1}. Aborting.")
+        return
+
     # Model, loss, optimiser
     model = UNet3D(in_channels=1, num_classes=args.num_classes, base_channels=args.base_channels).to(device)
     criterion = DiceLoss(weight=args.dice_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    # AMP scaler (only meaningful on CUDA)
+    use_amp = device.type == "cuda"
+    print(f"AMP enabled: {use_amp}")
+    scaler = torch.amp.GradScaler(device="cuda") if use_amp else torch.amp.GradScaler(enabled=False)
+
     # Training history
     history = {"train_loss": [], "val_loss": [], "val_dice": []}
     best_dice = 0.0
     os.makedirs(args.out_dir, exist_ok=True)
     metrics_csv = os.path.join(args.out_dir, "metrics.csv")
+
     # Training loop
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
         for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            # Non-blocking transfers for faster H2D when pin_memory=True
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            # Forward + loss with autocast on CUDA
+            ctx = torch.amp.autocast(device_type="cuda") if use_amp else nullcontext()
+            with ctx:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            # Backward + step via GradScaler when AMP is enabled
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             running_loss += loss.item() * images.size(0)
         train_loss = running_loss / len(train_ds) if len(train_ds) > 0 else 0.0
         history["train_loss"].append(train_loss)
+
         # Validation
         model.eval()
         val_loss = 0.0
         dice_scores = []
         with torch.no_grad():
             for images, labels in val_loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                ctx = torch.amp.autocast(device_type="cuda") if use_amp else nullcontext()
+                with ctx:
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
                 val_loss += loss.item() * images.size(0)
                 dice_scores.append(dice_coefficients(outputs, labels, args.num_classes))
         val_loss = val_loss / len(val_ds) if len(val_ds) > 0 else 0.0
+
         # Compute mean Dice across batches and classes
         if dice_scores:
             dice_scores = np.array(dice_scores)
@@ -140,13 +200,17 @@ def train(args: argparse.Namespace) -> None:
             mean_dice = 0.0
         history["val_loss"].append(val_loss)
         history["val_dice"].append(mean_dice)
+
         # Save metrics to CSV so plotting can be reproduced even if process is interrupted
         _write_metrics_csv(metrics_csv, epoch, train_loss, val_loss, mean_dice)
+
         # Save best model
         if mean_dice > best_dice:
             best_dice = mean_dice
             torch.save(model.state_dict(), os.path.join(args.out_dir, "best_model.pt"))
+
         print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {mean_dice:.4f}")
+
     # Plot learning curves using the recorded history length (avoid relying on args.epochs)
     n_epochs_recorded = len(history["train_loss"])
     if n_epochs_recorded == 0:
@@ -183,7 +247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size (number of volumes per batch)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--num_classes", type=int, default=5, help="Number of segmentation classes")
+    parser.add_argument("--num_classes", type=int, default=6, help="Number of segmentation classes (background + organs)")
     parser.add_argument("--base_channels", type=int, default=32, help="Number of base channels in UNet")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
     parser.add_argument("--dice_weight", type=float, default=1.0, help="Weight of Dice loss (0–1).  1 uses only Dice loss, 0 only CE.")
